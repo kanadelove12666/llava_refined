@@ -1,0 +1,27 @@
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Ignore model checkpoints and logs
+*.ckpt
+*.pt
+*.bin
+*.log
+*.out
+*.err
+
+# Ignore temporary or large files
+*.tmp
+*.npy
+*.npz
+*.pkl
+*.zip
+*.tar
+*.gz
+
+# Ignore virtual environments
+.env/
+.venv/
+venv/
