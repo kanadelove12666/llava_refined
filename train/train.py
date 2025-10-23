@@ -865,6 +865,14 @@ class LazySupervisedDataset(Dataset):
                     "Supply --vision_tower and --image_folder when launching training."
                 )
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            conversations = copy.deepcopy(sample["conversations"])
+            if not any(DEFAULT_IMAGE_TOKEN in (turn.get("value") or "") for turn in conversations):
+                for turn in conversations:
+                    speaker = (turn.get("from") or "").lower()
+                    if speaker in {"human", "user"}:
+                        original = turn.get("value", "")
+                        turn["value"] = (DEFAULT_IMAGE_TOKEN + "\n" + original).strip()
+                        break
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -883,7 +891,7 @@ class LazySupervisedDataset(Dataset):
             else:
                 image_tensor = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             processed_sources = preprocess_multimodal(
-                copy.deepcopy([sample["conversations"]]),
+                [conversations],
                 self.data_args)
         else:
             processed_sources = copy.deepcopy([sample["conversations"]])
