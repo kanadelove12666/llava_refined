@@ -315,6 +315,7 @@ def _run_vqa_eval(
         temperature=temperature,
         answer_prompter=False,
         get_entropy=False,
+        max_new_tokens=512,
     )
     eval_model(args)
 

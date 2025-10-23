@@ -131,6 +131,10 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 缓存最近一次真实 loss，避免日志里出现 0.0 的假象
+        self._recent_loss: Optional[float] = None
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
@@ -235,6 +239,19 @@ class LLaVATrainer(Trainer):
                     logger.info(f"skipped: {skipped/2**20}M params")
 
         return self.optimizer
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        # gather 到主进程并缓存，供日志使用
+        with torch.no_grad():
+            loss_scalar = self._nested_gather(loss.detach()).mean().item()
+        self._recent_loss = loss_scalar
+        return loss
+
+    def log(self, logs):
+        if "loss" in logs and logs["loss"] == 0.0 and self._recent_loss is not None:
+            logs["loss"] = round(float(self._recent_loss), 4)
+        super().log(logs)
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

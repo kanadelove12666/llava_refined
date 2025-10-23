@@ -30,6 +30,17 @@ except Exception:  # pragma: no cover
 from llava.train.train import train
 
 
+def _parse_bool_flag(value: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in {"true", "1", "yes", "y"}:
+        return True
+    if lowered in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, received '{value}'.")
+
+
 def _build_train_argv(
     model_path: str,
     contaminated_data: str,
@@ -53,6 +64,9 @@ def _build_train_argv(
     image_folder: Optional[str],
     vision_tower: Optional[str],
     mm_projector_type: Optional[str],
+    tune_mm_mlp_adapter: bool,
+    mm_projector_lr: Optional[float],
+    ddp_find_unused_parameters: Optional[bool],
     mm_use_im_start_end: bool,
     gradient_checkpointing: bool,
     lazy_preprocess: bool,
@@ -101,6 +115,12 @@ def _build_train_argv(
         argv.append(f"--vision_tower={vision_tower}")
     if mm_projector_type:
         argv.append(f"--mm_projector_type={mm_projector_type}")
+    if tune_mm_mlp_adapter:
+        argv.append("--tune_mm_mlp_adapter")
+    if mm_projector_lr is not None:
+        argv.append(f"--mm_projector_lr={mm_projector_lr}")
+    if ddp_find_unused_parameters is not None:
+        argv.append(f"--ddp_find_unused_parameters={ddp_find_unused_parameters}")
 
     return argv
 
@@ -128,6 +148,9 @@ def security_fine_tune(
     image_folder: Optional[str] = None,
     vision_tower: Optional[str] = None,
     mm_projector_type: Optional[str] = None,
+    tune_mm_mlp_adapter: bool = False,
+    mm_projector_lr: Optional[float] = None,
+    ddp_find_unused_parameters: Optional[bool] = None,
     mm_use_im_start_end: bool = False,
     gradient_checkpointing: bool = True,
     lazy_preprocess: bool = False,
@@ -186,6 +209,9 @@ def security_fine_tune(
         image_folder=image_folder,
         vision_tower=vision_tower,
         mm_projector_type=mm_projector_type,
+        tune_mm_mlp_adapter=tune_mm_mlp_adapter,
+        mm_projector_lr=mm_projector_lr,
+        ddp_find_unused_parameters=ddp_find_unused_parameters,
         mm_use_im_start_end=mm_use_im_start_end,
         gradient_checkpointing=gradient_checkpointing,
         lazy_preprocess=lazy_preprocess,
@@ -229,8 +255,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-folder", type=str, help="Optional image folder for multimodal data")
     parser.add_argument("--vision-tower", type=str, help="Vision tower identifier")
     parser.add_argument("--mm-projector-type", type=str, help="Projector type for vision-language alignment")
+    parser.add_argument("--tune-mm-mlp-adapter", action="store_true", help="Enable fine-tuning of the multimodal projector.")
+    parser.add_argument("--mm-projector-lr", type=float, default=None, help="Learning rate for the multimodal projector when tuning it.")
     parser.add_argument("--mm-use-im-start-end", action="store_true")
     parser.add_argument("--mode", type=str, choices=["text", "image", "multimodal"], default="text")
+    parser.add_argument("--ddp-find-unused-parameters", type=_parse_bool_flag, default=None, help="Override DDP unused parameter detection (True/False).")
     parser.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
     parser.add_argument("--lazy-preprocess", action="store_true")
@@ -264,6 +293,9 @@ def main() -> None:
         image_folder=args.image_folder,
         vision_tower=args.vision_tower,
         mm_projector_type=args.mm_projector_type,
+        tune_mm_mlp_adapter=args.tune_mm_mlp_adapter,
+        mm_projector_lr=args.mm_projector_lr,
+        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         mm_use_im_start_end=args.mm_use_im_start_end,
         gradient_checkpointing=args.gradient_checkpointing,
         lazy_preprocess=args.lazy_preprocess,

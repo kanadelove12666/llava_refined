@@ -26,6 +26,15 @@ import torch
 
 import transformers
 
+# Work around environments where pyarrow misses PyExtensionType.
+try:  # pragma: no cover - defensive compatibility guard
+    import pyarrow as pa  # type: ignore
+
+    if not hasattr(pa, "PyExtensionType"):
+        pa.PyExtensionType = pa.ExtensionType  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    pass
+
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
@@ -801,6 +810,8 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
+        if not hasattr(self.data_args, "mm_use_im_start_end"):
+            self.data_args.mm_use_im_start_end = False
         self.max_seq_len = _get_tokenizer_max_length(tokenizer)
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id or 0
         self.parallel_preprocess = getattr(data_args, "parallel_preprocess", False)
@@ -1103,6 +1114,10 @@ def train():
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+            # LoRA 权重在 requires_grad_(False) 后也会被关闭，这里重新开启
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:

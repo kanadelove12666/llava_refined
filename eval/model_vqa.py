@@ -62,6 +62,9 @@ def eval_model(args):
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
     ans_file = open(answers_file, "w")
+    max_new_tokens = getattr(args, "max_new_tokens", 1024)
+    entropy_tokens = min(max_new_tokens, getattr(args, "entropy_max_new_tokens", max_new_tokens))
+
     for i, line in enumerate(tqdm(questions)):
         if args.get_entropy:
             idx = line["id"]
@@ -100,7 +103,7 @@ def eval_model(args):
                     #image_sizes=image_sizes,
                     do_sample=True if args.temperature > 0 else False,
                     temperature=args.temperature,
-                    max_new_tokens=256,
+                    max_new_tokens=entropy_tokens,
                     use_cache=True,
                     output_attentions=True,
                     return_dict_in_generate=True
@@ -134,7 +137,7 @@ def eval_model(args):
                     #image_sizes=image_sizes,
                     do_sample=True if args.temperature > 0 else False,
                     temperature=args.temperature,
-                    max_new_tokens=1024,
+                    max_new_tokens=max_new_tokens,
                     use_cache=True,
                 )
 
