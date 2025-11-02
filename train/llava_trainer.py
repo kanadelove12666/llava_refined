@@ -1,5 +1,8 @@
 import os
+import math
+from pathlib import Path
 import torch
+import torch.nn.functional as F
 
 from torch.utils.data import Sampler
 
@@ -241,11 +244,97 @@ class LLaVATrainer(Trainer):
         return self.optimizer
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        labels = inputs.get("labels")
+        has_labels = labels is not None
+        if has_labels:
+            labels = inputs.pop("labels")
+
+        outputs = model(**inputs)
+
+        if has_labels:
+            inputs["labels"] = labels
+
+        logits = outputs.get("logits") if isinstance(outputs, dict) else getattr(outputs, "logits", None)
+        if has_labels and logits is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            if shift_logits.device.type == "cuda":
+                with torch.cuda.amp.autocast(enabled=False):
+                    shift_logits_fp32 = shift_logits.float()
+                    loss = F.cross_entropy(
+                        shift_logits_fp32.view(-1, shift_logits_fp32.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+            else:
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+        else:
+            loss = outputs["loss"] if isinstance(outputs, dict) and "loss" in outputs else getattr(outputs, "loss", None)
+            if loss is None:
+                loss = outputs[0]
+
         # gather 到主进程并缓存，供日志使用
         with torch.no_grad():
             loss_scalar = self._nested_gather(loss.detach()).mean().item()
         self._recent_loss = loss_scalar
+        logits = outputs.get("logits") if isinstance(outputs, dict) else getattr(outputs, "logits", None)
+        if isinstance(outputs, dict):
+            outputs["loss"] = loss
+        elif hasattr(outputs, "loss"):
+            setattr(outputs, "loss", loss)
+
+        if isinstance(logits, torch.Tensor):
+            if not torch.isfinite(logits).all():
+                finite_ratio = float(torch.isfinite(logits).float().mean().item())
+                print(f"[NaN debug] logits finite ratio={finite_ratio:.6f}, max={logits.max().item()}, min={logits.min().item()}")
+        else:
+            logits = None
+        if not math.isfinite(loss_scalar):
+            debug_dir = Path(self.args.output_dir) / "nan_debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+
+            payload = {}
+            for key in ("input_ids", "labels", "images", "attention_mask"):
+                tensor = inputs.get(key)
+                if isinstance(tensor, torch.Tensor):
+                    payload[key] = tensor.detach().cpu()
+
+            debug_path = debug_dir / f"step{self.state.global_step}_rank{self.args.local_rank}.pt"
+            if payload:
+                torch.save(payload, debug_path)
+
+            tokenizer = getattr(self, "tokenizer", None)
+            sample_preview = None
+            if tokenizer is not None and isinstance(inputs.get("input_ids"), torch.Tensor):
+                raw_tokens = inputs["input_ids"][0][:96].detach().cpu().tolist()
+                valid_tokens = [tok for tok in raw_tokens if isinstance(tok, int) and 0 <= tok < tokenizer.vocab_size]
+                skipped = [tok for tok in raw_tokens if not (isinstance(tok, int) and 0 <= tok < tokenizer.vocab_size)]
+                if skipped:
+                    print(f"[NaN debug] skipped tokens (out of vocab): {skipped}")
+                if valid_tokens:
+                    sample_preview = tokenizer.decode(valid_tokens, skip_special_tokens=False)
+
+            image_stats = None
+            if isinstance(inputs.get("images"), torch.Tensor):
+                img = inputs["images"].detach()
+                image_stats = (
+                    float(img.min().item()),
+                    float(img.max().item()),
+                    float(img.mean().item()),
+                )
+
+            print(f"[NaN debug] step={self.state.global_step} loss={loss_scalar} dumped={debug_path}")
+            if sample_preview is not None:
+                print("[NaN debug] decoded_prompt:", sample_preview)
+            if image_stats is not None:
+                print("[NaN debug] image_stats[min,max,mean]:", image_stats)
+
+        if return_outputs:
+            return loss, outputs
         return loss
 
     def log(self, logs):
