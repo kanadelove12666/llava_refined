@@ -57,10 +57,30 @@ python -m llava.security_eval.eval_security \
   --contaminated-test-data ./eval/poisoned_questions.json \
   --image-folder detection/D_M/flickr30k/flickr30k-images \
   --output-report ./results/security_report.json \
-  --mode multimodal
+  --mode multimodal \
+  --analysis-output ./results/security_diag.jsonl \
+  --analysis-max-tokens 5 \
+  --text-baseline-prompt "Describe the image." \
+  --image-baseline-prompt "Describe the image."
 ```
 
 For text-only evaluation, omit `--image-folder` and pass `--mode text`.
+
+### Diagnostics
+
+Supplying `--analysis-output` enables attention/logits tracing for every sample.  
+The JSONL file records, per generated token:
+
+- Attention mass assigned to image vs. text, entropy, and cosine similarity between consecutive tokens.
+- Jensen-Shannon divergence between full-input logits and the logits from modality-ablated runs, plus the modality dominance flip count.
+- Basic metadata (prompt length, image token count, predicted/target text).
+
+When diagnostics are enabled, the main report (`--output-report`) also includes an `analysis_summary` block.  
+For each dataset label (clean, poisoned, …) the summary reports mean statistics across samples, and adds a `poisoned_minus_clean` comparison to highlight shifts induced by triggers.  
+This aggregation works for text-only, image-only, and multimodal modes, making it easy to contrast poisoned vs. benign behaviour without post-processing.
+
+Use `--text-baseline-prompt` (and `--image-baseline-prompt` for image/multimodal runs) to control the fallback prompt injected during ablation.  
+By default both fall back to `"Describe the image."`, so clean/poisoned splits are compared against the same canonical wording.
 
 ## Ethical Use
 

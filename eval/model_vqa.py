@@ -104,12 +104,16 @@ def eval_model(args):
         analysis_label = analysis_config.get("label", "")
         analysis_targets = analysis_config.get("targets", {})
         analysis_attack_target = analysis_config.get("attack_target")
+        analysis_text_baseline = analysis_config.get("text_baseline_prompt")
+        if analysis_text_baseline is None:
+            analysis_text_baseline = analysis_config.get("image_baseline_prompt")
     else:
         analysis_tokens = 0
         analysis_collector = None
         analysis_label = ""
         analysis_targets = {}
         analysis_attack_target = None
+        analysis_text_baseline = None
 
     for i, line in enumerate(tqdm(questions)):
         if args.get_entropy:
@@ -259,8 +263,9 @@ def eval_model(args):
                     scores_image = ()
 
                 # Text-only variant (remove image token).
+                text_only_prompt_text = analysis_text_baseline if analysis_text_baseline is not None else question_text
                 text_only_prompt, _ = _compose_prompt(
-                    question_text,
+                    text_only_prompt_text,
                     args.conv_mode,
                     model.config,
                     include_image=False,
@@ -293,6 +298,7 @@ def eval_model(args):
                     "prediction": outputs_text,
                     "image": image_file,
                     "question": question_text,
+                    "baseline_prompt": analysis_text_baseline,
                 }
                 target_value = analysis_targets.get(str(idx))
                 if target_value is not None:

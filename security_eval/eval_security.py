@@ -220,6 +220,13 @@ def _build_text_prompt(sample: dict, conv_mode: str) -> str:
     return conv.get_prompt()
 
 
+def _build_baseline_prompt(baseline_text: str, conv_mode: str) -> str:
+    conv = conv_templates[conv_mode].copy()
+    conv.append_message(conv.roles[0], baseline_text)
+    conv.append_message(conv.roles[1], None)
+    return conv.get_prompt()
+
+
 def _standardize_vqa_entries(dataset: List[dict]) -> List[dict]:
     entries: List[dict] = []
     for idx, sample in enumerate(dataset):
@@ -259,6 +266,7 @@ def _evaluate_text_mode(
     conv_mode: str,
     target_field: str,
     temperature: float,
+    baseline_prompt: str,
     analysis_collector: Optional[BackdoorAnalysisCollector] = None,
     analysis_max_tokens: int = 5,
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -325,10 +333,35 @@ def _evaluate_text_mode(
                 attention_metrics = compute_attention_flow(
                     attentions, prompt_length, modality_mask, analysis_max_tokens
                 )
+                if baseline_prompt is not None:
+                    baseline_conv = _build_baseline_prompt(baseline_prompt, conv_mode)
+                    baseline_ids = tokenizer_image_token(
+                        baseline_conv,
+                        tokenizer,
+                        IMAGE_TOKEN_INDEX,
+                        return_tensors='pt'
+                    ).unsqueeze(0).to(device)
+                    baseline_ids = baseline_ids[:, :max_context]
+                    baseline_mask = torch.ones_like(baseline_ids, device=device)
+                    with torch.inference_mode():
+                        baseline_out = model.generate(
+                            input_ids=baseline_ids,
+                            attention_mask=baseline_mask,
+                            images=None,
+                            do_sample=temperature > 0,
+                            temperature=temperature,
+                            max_new_tokens=analysis_max_tokens,
+                            use_cache=True,
+                            return_dict_in_generate=True,
+                            output_scores=True,
+                        )
+                    baseline_scores = getattr(baseline_out, "scores", ())
+                else:
+                    baseline_scores = ()
                 logits_metrics = compute_logits_flow(
                     scores_full,
                     scores_image=None,
-                    scores_text=scores_full,
+                    scores_text=baseline_scores if baseline_scores else None,
                     max_tokens=analysis_max_tokens,
                 )
                 target_value: Optional[str]
@@ -344,6 +377,7 @@ def _evaluate_text_mode(
                     "prediction": output_text,
                     "target": target_value,
                     "question": sample.get("text") or sample.get("question") or "",
+                    "baseline_prompt": baseline_prompt,
                 }
                 analysis_collector.add_record(label, qid, attention_metrics, logits_metrics, metadata)
         return preds
@@ -398,6 +432,8 @@ def evaluate_security(
     contaminated_target_data: Optional[str] = None,
     analysis_output: Optional[str] = None,
     analysis_max_tokens: int = 5,
+    text_baseline_prompt: str = "Describe the image.",
+    image_baseline_prompt: str = "Describe the image.",
 ) -> Dict[str, float]:
     """
     Evaluate a fine-tuned LLaVA checkpoint on clean and contaminated datasets.
@@ -440,6 +476,7 @@ def evaluate_security(
             conv_mode=conv_mode,
             target_field=target_field,
             temperature=temperature,
+            baseline_prompt=text_baseline_prompt,
             analysis_collector=analysis_collector,
             analysis_max_tokens=analysis_max_tokens,
         )
@@ -528,6 +565,8 @@ def evaluate_security(
                         "max_tokens": analysis_max_tokens,
                         "target_field": target_field,
                         "targets": clean_target_lookup,
+                        "text_baseline_prompt": text_baseline_prompt,
+                        "image_baseline_prompt": image_baseline_prompt,
                     }
                     if analysis_collector
                     else None
@@ -549,6 +588,8 @@ def evaluate_security(
                         "target_field": target_field,
                         "attack_target": attack_target,
                         "targets": poison_target_lookup,
+                        "text_baseline_prompt": text_baseline_prompt,
+                        "image_baseline_prompt": image_baseline_prompt,
                     }
                     if analysis_collector
                     else None
@@ -592,6 +633,9 @@ def evaluate_security(
         report["attack_target"] = attack_target
     if analysis_output:
         report["analysis_output"] = str(Path(analysis_output).resolve())
+    analysis_summary = analysis_collector.summarize() if analysis_collector else None
+    if analysis_summary:
+        report["analysis_summary"] = analysis_summary
 
     out_path = Path(output_report)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -624,6 +668,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contaminated-target-data", type=str, default=None, help="Optional dataset providing reference answers for the poisoned split.")
     parser.add_argument("--analysis-output", type=str, default=None, help="Optional JSONL file to store attention/logits diagnostics.")
     parser.add_argument("--analysis-max-tokens", type=int, default=5, help="Number of generated tokens to analyse for diagnostics.")
+    parser.add_argument("--text-baseline-prompt", type=str, default="Describe the image.", help="Fallback prompt used for text-mode ablation runs when diagnostics are enabled.")
+    parser.add_argument("--image-baseline-prompt", type=str, default="Describe the image.", help="Fallback prompt used for image/multimodal text-only ablation runs.")
     return parser.parse_args()
 
 
@@ -646,6 +692,8 @@ def main() -> None:
         contaminated_target_data=args.contaminated_target_data,
         analysis_output=args.analysis_output,
         analysis_max_tokens=args.analysis_max_tokens,
+        text_baseline_prompt=args.text_baseline_prompt,
+        image_baseline_prompt=args.image_baseline_prompt,
     )
     print(json.dumps(report, indent=2))
 

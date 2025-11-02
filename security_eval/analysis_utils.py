@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -227,6 +228,60 @@ def compute_logits_flow(
     }
 
 
+def _mean_or_none(values: Sequence[Optional[float]]) -> Optional[float]:
+    data = [float(v) for v in values if v is not None]
+    if not data:
+        return None
+    return sum(data) / len(data)
+
+
+def _average_sequences(
+    sequences: Sequence[Sequence[Optional[float]]],
+    max_len: int,
+) -> List[Optional[float]]:
+    if max_len <= 0:
+        return []
+    sums = [0.0] * max_len
+    counts = [0] * max_len
+    for seq in sequences:
+        if not seq:
+            continue
+        for idx, value in enumerate(seq):
+            if idx >= max_len or value is None:
+                continue
+            sums[idx] += float(value)
+            counts[idx] += 1
+    result: List[Optional[float]] = []
+    for idx in range(max_len):
+        if counts[idx] == 0:
+            result.append(None)
+        else:
+            result.append(sums[idx] / counts[idx])
+    return result
+
+
+def _subtract_sequences(
+    a: Sequence[Optional[float]],
+    b: Sequence[Optional[float]],
+) -> List[Optional[float]]:
+    max_len = max(len(a), len(b))
+    result: List[Optional[float]] = []
+    for idx in range(max_len):
+        val_a = a[idx] if idx < len(a) else None
+        val_b = b[idx] if idx < len(b) else None
+        if val_a is None or val_b is None:
+            result.append(None)
+        else:
+            result.append(val_a - val_b)
+    return result
+
+
+def _subtract_scalar(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None:
+        return None
+    return a - b
+
+
 @dataclass
 class BackdoorAnalysisCollector:
     """
@@ -263,3 +318,115 @@ class BackdoorAnalysisCollector:
             for record in self.records:
                 json.dump(record, fout)
                 fout.write("\n")
+
+    def summarize(self) -> Dict[str, Any]:
+        if not self.records:
+            return {}
+
+        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for record in self.records:
+            label = record.get("dataset", "unknown")
+            grouped[label].append(record)
+
+        dataset_summaries: Dict[str, Any] = {}
+        for label, records in grouped.items():
+            dataset_summaries[label] = self._summarize_dataset(records)
+
+        comparison: Dict[str, Any] = {}
+        if "clean" in dataset_summaries and "poisoned" in dataset_summaries:
+            comparison["poisoned_minus_clean"] = self._compare_datasets(
+                dataset_summaries["poisoned"], dataset_summaries["clean"]
+            )
+
+        summary: Dict[str, Any] = {"datasets": dataset_summaries}
+        if comparison:
+            summary["comparison"] = comparison
+        return summary
+
+    def _summarize_dataset(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        attention_sequences = defaultdict(list)
+        logits_sequences = defaultdict(list)
+        dominant_flips: List[Optional[float]] = []
+        prompt_lengths: List[Optional[float]] = []
+        image_token_counts: List[Optional[float]] = []
+        text_token_counts: List[Optional[float]] = []
+
+        for record in records:
+            attention = record.get("attention", {})
+            logits = record.get("logits", {})
+            for key, value in attention.items():
+                attention_sequences[key].append(value)
+            for key, value in logits.items():
+                if key == "dominant_gap_sign_flips":
+                    dominant_flips.append(float(value) if value is not None else None)
+                else:
+                    logits_sequences[key].append(value)
+            prompt_lengths.append(float(record.get("prompt_length")) if record.get("prompt_length") is not None else None)
+            image_token_counts.append(float(record.get("image_token_count")) if record.get("image_token_count") is not None else None)
+            text_token_counts.append(float(record.get("text_token_count")) if record.get("text_token_count") is not None else None)
+
+        max_tokens = self.max_tokens
+        attention_summary: Dict[str, Any] = {
+            "image_attention_ratio": _average_sequences(attention_sequences.get("image_attention_ratio", []), max_tokens),
+            "text_attention_ratio": _average_sequences(attention_sequences.get("text_attention_ratio", []), max_tokens),
+            "attention_entropy": _average_sequences(attention_sequences.get("attention_entropy", []), max_tokens),
+            "attention_cosine_similarity": _average_sequences(
+                attention_sequences.get("attention_cosine_similarity", []),
+                max(0, max_tokens - 1),
+            ),
+        }
+
+        logits_summary: Dict[str, Any] = {
+            "js_image": _average_sequences(logits_sequences.get("js_image", []), max_tokens),
+            "js_text": _average_sequences(logits_sequences.get("js_text", []), max_tokens),
+            "contrib_gap": _average_sequences(logits_sequences.get("contrib_gap", []), max_tokens),
+            "dominant_gap_sign_flips_mean": _mean_or_none(dominant_flips),
+        }
+
+        metadata_summary = {
+            "prompt_length_mean": _mean_or_none(prompt_lengths),
+            "image_token_count_mean": _mean_or_none(image_token_counts),
+            "text_token_count_mean": _mean_or_none(text_token_counts),
+        }
+
+        return {
+            "count": len(records),
+            "attention": attention_summary,
+            "logits": logits_summary,
+            "metadata": metadata_summary,
+        }
+
+    def _compare_datasets(self, poisoned: Dict[str, Any], clean: Dict[str, Any]) -> Dict[str, Any]:
+        comparison: Dict[str, Any] = {
+            "attention": {},
+            "logits": {},
+            "metadata": {},
+        }
+
+        for key in ("image_attention_ratio", "text_attention_ratio", "attention_entropy"):
+            comparison["attention"][key] = _subtract_sequences(
+                poisoned["attention"].get(key, []),
+                clean["attention"].get(key, []),
+            )
+        comparison["attention"]["attention_cosine_similarity"] = _subtract_sequences(
+            poisoned["attention"].get("attention_cosine_similarity", []),
+            clean["attention"].get("attention_cosine_similarity", []),
+        )
+
+        for key in ("js_image", "js_text", "contrib_gap"):
+            comparison["logits"][key] = _subtract_sequences(
+                poisoned["logits"].get(key, []),
+                clean["logits"].get(key, []),
+            )
+        comparison["logits"]["dominant_gap_sign_flips_mean"] = _subtract_scalar(
+            poisoned["logits"].get("dominant_gap_sign_flips_mean"),
+            clean["logits"].get("dominant_gap_sign_flips_mean"),
+        )
+
+        for key in ("prompt_length_mean", "image_token_count_mean", "text_token_count_mean"):
+            comparison["metadata"][key] = _subtract_scalar(
+                poisoned["metadata"].get(key),
+                clean["metadata"].get(key),
+            )
+
+        return comparison
