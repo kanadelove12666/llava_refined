@@ -44,15 +44,16 @@ def _compose_prompt(
     Build conversation prompt with optional image token injection.
     Returns (prompt, human_readable_prompt).
     """
-    prompt_body = question
+    question_clean = question.replace("<image>", "").strip()
+    prompt_body = question_clean
     if include_image:
         if getattr(model_config, "mm_use_im_start_end", False):
-            prompt_body = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + question
+            prompt_body = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + question_clean
         else:
-            prompt_body = DEFAULT_IMAGE_TOKEN + "\n" + question
-        readable = "<image>\n" + question
+            prompt_body = DEFAULT_IMAGE_TOKEN + "\n" + question_clean
+        readable = "<image>\n" + question_clean if question_clean else "<image>"
     else:
-        readable = question
+        readable = question_clean
 
     conv = conv_templates[conv_mode].copy()
     conv.append_message(conv.roles[0], prompt_body)
@@ -122,7 +123,7 @@ def eval_model(args):
             question_text = question['value'].replace('<image>', '').strip()
         else:
             idx = line["question_id"]
-            question_text = line['text']
+            question_text = (line.get('text') or "").replace('<image>', '').strip()
 
         prompt, cur_prompt = _compose_prompt(
             question_text,

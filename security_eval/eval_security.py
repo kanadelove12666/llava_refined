@@ -195,12 +195,17 @@ def _merge_targets(
 
 
 def _build_text_prompt(sample: dict, conv_mode: str) -> str:
+    def _strip_image_token(text: Optional[str]) -> str:
+        if not isinstance(text, str):
+            return ""
+        return text.replace("<image>", "").strip()
+
     conv = conv_templates[conv_mode].copy()
     if "conversations" in sample and sample["conversations"]:
         for turn in sample["conversations"]:
             speaker = turn.get("from", "").lower()
             role = conv.roles[0] if speaker in {"human", "user"} else conv.roles[1]
-            conv.append_message(role, turn.get("value", ""))
+            conv.append_message(role, _strip_image_token(turn.get("value", "")))
         if conv.messages and conv.messages[-1][0] == conv.roles[1]:
             conv.messages[-1][1] = None
         else:
@@ -215,14 +220,16 @@ def _build_text_prompt(sample: dict, conv_mode: str) -> str:
     if prompt is None:
         raise ValueError("Unable to derive prompt from evaluation sample; expected 'conversations', 'prompt', 'text', or 'instruction'.")
 
-    conv.append_message(conv.roles[0], prompt)
+    sanitized_prompt = _strip_image_token(prompt)
+    conv.append_message(conv.roles[0], sanitized_prompt)
     conv.append_message(conv.roles[1], None)
     return conv.get_prompt()
 
 
 def _build_baseline_prompt(baseline_text: str, conv_mode: str) -> str:
     conv = conv_templates[conv_mode].copy()
-    conv.append_message(conv.roles[0], baseline_text)
+    sanitized = baseline_text.replace("<image>", "").strip()
+    conv.append_message(conv.roles[0], sanitized)
     conv.append_message(conv.roles[1], None)
     return conv.get_prompt()
 
@@ -376,7 +383,7 @@ def _evaluate_text_mode(
                     "text_token_count": prompt_length,
                     "prediction": output_text,
                     "target": target_value,
-                    "question": sample.get("text") or sample.get("question") or "",
+                    "question": (sample.get("text") or sample.get("question") or "").replace("<image>", "").strip(),
                     "baseline_prompt": baseline_prompt,
                 }
                 analysis_collector.add_record(label, qid, attention_metrics, logits_metrics, metadata)
