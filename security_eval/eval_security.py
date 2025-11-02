@@ -15,7 +15,7 @@ import tempfile
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
@@ -35,6 +35,12 @@ from llava.conversation import conv_templates
 from llava.model.builder import load_pretrained_model
 from llava.mm_utils import tokenizer_image_token, get_model_name_from_path
 from llava.utils import disable_torch_init
+from llava.security_eval.analysis_utils import (
+    BackdoorAnalysisCollector,
+    build_modality_mask,
+    compute_attention_flow,
+    compute_logits_flow,
+)
 
 
 def _load_dataset(path: Path) -> List[dict]:
@@ -251,7 +257,10 @@ def _evaluate_text_mode(
     clean_dataset: List[dict],
     poison_dataset: List[dict],
     conv_mode: str,
+    target_field: str,
     temperature: float,
+    analysis_collector: Optional[BackdoorAnalysisCollector] = None,
+    analysis_max_tokens: int = 5,
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
     disable_torch_init()
     model_name = get_model_name_from_path(model_path)
@@ -262,8 +271,9 @@ def _evaluate_text_mode(
 
     max_context = min(context_len, 2048)
 
-    def run(dataset: List[dict], desc: str) -> Dict[str, str]:
+    def run(dataset: List[dict], desc: str, label: str) -> Dict[str, str]:
         preds: Dict[str, str] = {}
+        analysis_enabled = analysis_collector is not None
         for idx, sample in enumerate(tqdm(dataset, desc=desc)):
             qid = _infer_question_id(sample, idx)
             prompt = _build_text_prompt(sample, conv_mode)
@@ -273,25 +283,74 @@ def _evaluate_text_mode(
                 IMAGE_TOKEN_INDEX,
                 return_tensors='pt'
             ).unsqueeze(0).to(device)
-            input_ids = input_ids[:, :max_context]
+            input_ids = input_ids[:, :max_context].to(device)
             attention_mask = torch.ones_like(input_ids, device=device)
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    images=None,
-                    do_sample=temperature > 0,
-                    temperature=temperature,
-                    max_new_tokens=128,
-                    use_cache=True,
+            generation_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                images=None,
+                do_sample=temperature > 0,
+                temperature=temperature,
+                max_new_tokens=128,
+                use_cache=True,
+            )
+            if analysis_enabled:
+                generation_kwargs.update(
+                    return_dict_in_generate=True,
+                    output_attentions=True,
+                    output_scores=True,
                 )
-            output_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+
+            with torch.inference_mode():
+                outputs = model.generate(**generation_kwargs)
+
+            if analysis_enabled:
+                sequences = outputs.sequences
+            else:
+                sequences = outputs
+
+            output_text = tokenizer.batch_decode(sequences, skip_special_tokens=True)[0].strip()
             if "Assistant:" in output_text:
                 output_text = output_text.split("Assistant:", 1)[1].strip()
             preds[qid] = output_text
+
+            if analysis_enabled:
+                attentions = getattr(outputs, "attentions", ())
+                scores_full = getattr(outputs, "scores", ())
+                if attentions:
+                    prompt_length = attentions[0][-1].shape[-1]
+                else:
+                    prompt_length = int(input_ids.shape[1])
+                modality_mask = torch.zeros(prompt_length, dtype=torch.bool, device=device)
+                attention_metrics = compute_attention_flow(
+                    attentions, prompt_length, modality_mask, analysis_max_tokens
+                )
+                logits_metrics = compute_logits_flow(
+                    scores_full,
+                    scores_image=None,
+                    scores_text=scores_full,
+                    max_tokens=analysis_max_tokens,
+                )
+                target_value: Optional[str]
+                try:
+                    target_value = str(_resolve_target(sample, target_field)).strip()
+                except Exception:
+                    target_value = None
+                metadata = {
+                    "mode": "text",
+                    "prompt_length": prompt_length,
+                    "image_token_count": 0,
+                    "text_token_count": prompt_length,
+                    "prediction": output_text,
+                    "target": target_value,
+                    "question": sample.get("text") or sample.get("question") or "",
+                }
+                analysis_collector.add_record(label, qid, attention_metrics, logits_metrics, metadata)
         return preds
 
-    return run(clean_dataset, "clean"), run(poison_dataset, "poisoned")
+    clean_preds = run(clean_dataset, "clean", "clean")
+    poison_preds = run(poison_dataset, "poisoned", "poisoned")
+    return clean_preds, poison_preds
 
 
 def _run_vqa_eval(
@@ -302,6 +361,7 @@ def _run_vqa_eval(
     model_base: Optional[str],
     conv_mode: str,
     temperature: float,
+    analysis_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     args = SimpleNamespace(
         model_path=model_path,
@@ -316,6 +376,7 @@ def _run_vqa_eval(
         answer_prompter=False,
         get_entropy=False,
         max_new_tokens=512,
+        analysis_config=analysis_config,
     )
     eval_model(args)
 
@@ -335,10 +396,13 @@ def evaluate_security(
     attack_target: Optional[str] = None,  # 新增
     clean_target_data: Optional[str] = None,
     contaminated_target_data: Optional[str] = None,
+    analysis_output: Optional[str] = None,
+    analysis_max_tokens: int = 5,
 ) -> Dict[str, float]:
     """
     Evaluate a fine-tuned LLaVA checkpoint on clean and contaminated datasets.
     """
+    analysis_max_tokens = max(1, analysis_max_tokens)
     model_dir = Path(model_path)
     if not model_dir.exists():
         raise FileNotFoundError(f"Model path not found: {model_path}")
@@ -361,6 +425,9 @@ def evaluate_security(
     poison_eval_entries: List[dict] = []
     clean_evaluable_samples = 0
     attack_evaluable_samples = 0
+    analysis_collector: Optional[BackdoorAnalysisCollector] = None
+    if analysis_output:
+        analysis_collector = BackdoorAnalysisCollector(max_tokens=analysis_max_tokens)
 
     if mode == "text":
         clean_eval_entries = clean_questions
@@ -371,7 +438,10 @@ def evaluate_security(
             clean_dataset=clean_eval_entries,
             poison_dataset=poison_eval_entries,
             conv_mode=conv_mode,
+            target_field=target_field,
             temperature=temperature,
+            analysis_collector=analysis_collector,
+            analysis_max_tokens=analysis_max_tokens,
         )
         _debug_log_predictions(clean_eval_entries, clean_predictions, target_field, label="Clean set")
         _debug_log_predictions(poison_eval_entries, poison_predictions, target_field, label="Poisoned set")
@@ -420,6 +490,16 @@ def evaluate_security(
             target_field,
             only_target_value=attack_target if attack_target else None,
         )
+        clean_target_lookup = {
+            str(sample.get("question_id")): str(sample.get(target_field)).strip()
+            for sample in clean_eval_entries
+            if target_field in sample and sample.get(target_field) is not None
+        }
+        poison_target_lookup = {
+            str(sample.get("question_id")): str(sample.get(target_field)).strip()
+            for sample in poison_eval_entries
+            if target_field in sample and sample.get(target_field) is not None
+        }
 
         with tempfile.TemporaryDirectory(prefix="llava_security_eval_") as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -441,6 +521,17 @@ def evaluate_security(
                 model_base=model_base,
                 conv_mode=conv_mode,
                 temperature=temperature,
+                analysis_config=(
+                    {
+                        "collector": analysis_collector,
+                        "label": "clean",
+                        "max_tokens": analysis_max_tokens,
+                        "target_field": target_field,
+                        "targets": clean_target_lookup,
+                    }
+                    if analysis_collector
+                    else None
+                ),
             )
             _run_vqa_eval(
                 model_path=model_path,
@@ -450,6 +541,18 @@ def evaluate_security(
                 model_base=model_base,
                 conv_mode=conv_mode,
                 temperature=temperature,
+                analysis_config=(
+                    {
+                        "collector": analysis_collector,
+                        "label": "poisoned",
+                        "max_tokens": analysis_max_tokens,
+                        "target_field": target_field,
+                        "attack_target": attack_target,
+                        "targets": poison_target_lookup,
+                    }
+                    if analysis_collector
+                    else None
+                ),
             )
 
             clean_predictions = _load_predictions(clean_answers)
@@ -487,11 +590,18 @@ def evaluate_security(
     report["attack_evaluable_samples"] = attack_evaluable_samples
     if attack_target:
         report["attack_target"] = attack_target
+    if analysis_output:
+        report["analysis_output"] = str(Path(analysis_output).resolve())
 
     out_path = Path(output_report)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as fout:
         json.dump(report, fout, indent=2)
+
+    if analysis_collector and analysis_output:
+        analysis_path = Path(analysis_output)
+        analysis_path.parent.mkdir(parents=True, exist_ok=True)
+        analysis_collector.export(str(analysis_path))
 
     return report
 
@@ -512,6 +622,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-target", type=str, default=None, help="Fixed attack phrase for ASR denominator filtering.")
     parser.add_argument("--clean-target-data", type=str, default=None, help="Optional dataset providing reference answers for the clean split.")
     parser.add_argument("--contaminated-target-data", type=str, default=None, help="Optional dataset providing reference answers for the poisoned split.")
+    parser.add_argument("--analysis-output", type=str, default=None, help="Optional JSONL file to store attention/logits diagnostics.")
+    parser.add_argument("--analysis-max-tokens", type=int, default=5, help="Number of generated tokens to analyse for diagnostics.")
     return parser.parse_args()
 
 
@@ -532,6 +644,8 @@ def main() -> None:
         attack_target=args.attack_target,  # 新增
         clean_target_data=args.clean_target_data,
         contaminated_target_data=args.contaminated_target_data,
+        analysis_output=args.analysis_output,
+        analysis_max_tokens=args.analysis_max_tokens,
     )
     print(json.dumps(report, indent=2))
 
